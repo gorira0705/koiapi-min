@@ -1,265 +1,204 @@
-// Vercel Node.js Serverless Function (CommonJS)
-// POST /api/analyze
-// - 期待: Flutter から { sessionName, chatLog, source, relation, goal, extraInfo, speakerGender } が飛んでくる
-// - 応答: { result: DiagnosisResult-like JSON, source: 'openai'|'mock' }
+// path: api/analyze.js
 
-const OPENAI_URL = "https://api.openai.com/v1/responses";
-const MODEL = "gpt-4o-mini"; // 指定どおり。文字量/コストのバランスが良い
-
-// CORS と共通レスポンスヘッダ
-function setHeaders(res) {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
-
-// Flutter 側が失敗時にモックへフォールバックできるよう、ここでも保険として超簡易モックを返せるようにしておく
-function mockResult() {
-  return {
-    categories: ["共感力", "質問力", "話題展開", "柔軟性", "テンポ"],
-    scores: [4.1, 3.7, 4.0, 3.3, 4.2],
-    comments: {
-      "共感力": "相手の感情を要約＋感情ラベリングで受け止められています。",
-      "質問力": "Why/How を1発足すと深度が上がります。",
-      "話題展開": "自己開示→橋渡しが自然です。",
-      "柔軟性": "文量を相手に寄せるとさらに◎。",
-      "テンポ": "放置感のないテンポです。"
-    },
-    freeSummary:
-      "総合的に“安心して話せる人”。Why質問を1回だけ挟み、短い言い換え→質問の順で熱量を維持しましょう。",
-    myMBTI: "INFP",
-    myMbtiLongText:
-      "価値観と優しさを軸に関わるタイプ。短いリアクション→本返信の2段運用が合います。",
-    partnerMBTI: "ENFJ",
-    compatibilityText:
-      "理念と配慮がかみ合う相性。過剰な気遣いを防ぐため小さな本音共有を早めに。",
-    compatibilityAxes: ["価値観整合", "会話の相性", "感情共有", "未来志向", "距離感調整"],
-    compatibilityScores: [4.5, 3.8, 4.1, 4.0, 3.9],
-    compatibilityReasons: {
-      "価値観整合": "重視する軸が近いので協力関係が築きやすい。",
-      "会話の相性": "丁寧さとまとめ役が相補的。",
-      "感情共有": "安心安全の空気感を双方が重視。",
-      "未来志向": "理想と実装の橋渡しができる。",
-      "距離感調整": "希望の定期共有が調整弁に。"
-    },
-    detailedAdvice: {
-      "共感力": [
-        { action: "要約＋感情で返す", effect: "自己開示が続きやすい", example: "「それ、不安もあったよね。」" }
-      ],
-      "質問力": [
-        { action: "Why/Howを1発", effect: "深掘りになる", example: "「どうしてそう思った？」" }
-      ]
-    },
-    partnerProfile: {
-      greenLines: ["具体称賛", "小さな共同作業"],
-      redLines: ["理由不明の放置", "皮肉強めの冗談"],
-      goodPhrases: ["「その選択いいね。特に○○が」"],
-      badPhrases: ["「普通こうでしょ？」"],
-      contactStyle: "短いやり取りが安心感につながる。",
-      dateTips: "静かに話せる場所＋写真映えの両立が◎。",
-      conflictPattern: "配慮不足に見える一言が発火点。",
-      reconcileTips: "事実→意図→感情→今後の順で短く。",
-      progression: "次の小さなアクションを合意して前進。"
-    }
-  };
-}
-
-// JSON Schema（DiagnosisResult 互換。可変キーを含むところは additionalProperties を許可）
-const schema = {
-  name: "DiagnosisResultSchema",
-  strict: true,
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      categories: { type: "array", minItems: 5, maxItems: 8, items: { type: "string" } },
-      scores: { type: "array", minItems: 5, maxItems: 8, items: { type: "number" } },
-      comments: { type: "object", additionalProperties: { type: "string" } },
-      freeSummary: { type: "string" },
-      myMBTI: { type: "string" },
-      myMbtiLongText: { type: "string" },
-      partnerMBTI: { type: "string" },
-      compatibilityText: { type: "string" },
-      compatibilityAxes: { type: "array", minItems: 5, maxItems: 8, items: { type: "string" } },
-      compatibilityScores: { type: "array", minItems: 5, maxItems: 8, items: { type: "number" } },
-      compatibilityReasons: { type: "object", additionalProperties: { type: "string" } },
-      detailedAdvice: {
-        type: "object",
-        additionalProperties: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              action: { type: "string" },
-              effect: { type: "string" },
-              example: { type: "string" }
-            },
-            required: ["action", "effect", "example"]
-          }
-        }
-      },
-      partnerProfile: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          greenLines: { type: "array", items: { type: "string" } },
-          redLines: { type: "array", items: { type: "string" } },
-          goodPhrases: { type: "array", items: { type: "string" } },
-          badPhrases: { type: "array", items: { type: "string" } },
-          contactStyle: { type: "string" },
-          dateTips: { type: "string" },
-          conflictPattern: { type: "string" },
-          reconcileTips: { type: "string" },
-          progression: { type: "string" }
-        },
-        required: [
-          "greenLines","redLines","goodPhrases","badPhrases",
-          "contactStyle","dateTips","conflictPattern","reconcileTips","progression"
-        ]
-      }
-    },
-    required: [
-      "categories","scores","comments","freeSummary",
-      "myMBTI","myMbtiLongText","partnerMBTI",
-      "compatibilityText","compatibilityAxes","compatibilityScores","compatibilityReasons",
-      "detailedAdvice","partnerProfile"
-    ]
-  }
-};
-
-module.exports = async (req, res) => {
-  setHeaders(res);
-
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST, OPTIONS");
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
+export default async function handler(req, res) {
+  // --- CORS（簡易）---
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+    return res.status(500).json({ source: 'mock', error: 'OPENAI_API_KEY is missing' });
   }
 
-  // 受け取り
-  const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+  // 受け取り（空でも動く）
+  const chunks = [];
+  for await (const ch of req) chunks.push(ch);
+  const raw = Buffer.concat(chunks).toString() || '{}';
+  let body = {};
+  try { body = JSON.parse(raw); } catch {}
+
   const {
-    sessionName = "診断",
-    chatLog = "",
-    source = "",
-    relation = "",
-    goal = "",
-    extraInfo = "",
-    speakerGender = "neutral"
+    sessionName = '診断',
+    chatLog = '',
+    source = '',
+    relation = '',
+    goal = '',
+    extraInfo = '',
+    speakerGender = 'neutral', // 'male' | 'female' | 'neutral'
   } = body;
 
-  // 口調の微調整（中性ベース＋“うっすら反対性別に寄せる”）
-  const toneHint =
-    speakerGender === "male"
-      ? "相手が女性に伝わりやすい柔らかいニュアンスをうっすら混ぜる"
-      : speakerGender === "female"
-      ? "相手が男性に伝わりやすい率直さをうっすら混ぜる"
-      : "どの性別にも自然な中立トーンを保つ";
+  // -------- OpenAI 呼び出し（Responses API）---------
+  const OPENAI_URL = 'https://api.openai.com/v1/responses';
+  const MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
-  // プロンプト（日本語・JSON厳格）
-  const systemPrompt = [
-    "あなたは日本語の会話分析の専門家です。",
-    "入力されたLINE等の会話ログとメタ情報から、会話スキルと相性を評価し、",
-    "必ず与えられた JSON Schema に厳密準拠した JSON を返してください。",
-    `口調は中性を基本に、${toneHint}。`,
-    "具体的・短文中心で、コピペして使える例文を含めます。",
-    "MBTIは仮説として簡潔に。レーダー配列は 1..5 の範囲で。"
-  ].join("\n");
+  // “出力JSONの型”を絶対守らせるため、形をサンプルで固定
+  const schemaExample = {
+    categories: ["共感力","質問力","話題展開","柔軟性","テンポ"],
+    scores: [3.9,3.5,3.8,3.2,3.7],
+    comments: {
+      "共感力": "…",
+      "質問力": "…",
+      "話題展開": "…",
+      "柔軟性": "…",
+      "テンポ": "…"
+    },
+    freeSummary: "…",
+    myMBTI: "INFP",
+    myMbtiLongText: "…",
+    partnerMBTI: "ENFJ",
+    compatibilityText: "…",
+    compatibilityAxes: ["価値観整合","会話の相性","感情共有","未来志向","距離感調整"],
+    compatibilityScores: [4.1,3.8,3.9,3.7,3.6],
+    compatibilityReasons: {
+      "価値観整合": "…",
+      "会話の相性": "…",
+      "感情共有": "…",
+      "未来志向": "…",
+      "距離感調整": "…"
+    },
+    detailedAdvice: {
+      "共感力":[{"action":"…","effect":"…","example":"…"}],
+      "質問力":[{"action":"…","effect":"…","example":"…"}],
+      "話題展開":[{"action":"…","effect":"…","example":"…"}],
+      "柔軟性":[{"action":"…","effect":"…","example":"…"}],
+      "テンポ":[{"action":"…","effect":"…","example":"…"}]
+    },
+    partnerProfile: {
+      greenLines: ["…"],
+      redLines: ["…"],
+      goodPhrases: ["…"],
+      badPhrases: ["…"],
+      contactStyle: "…",
+      dateTips: "…",
+      conflictPattern: "…",
+      reconcileTips: "…",
+      progression: "…"
+    }
+  };
 
-  const userPrompt = [
-    `【セッション名】${sessionName}`,
-    `【出会い方】${source}`,
-    `【関係性】${relation}`,
-    `【ゴール】${goal}`,
-    `【補足】${extraInfo}`,
-    "――――――――――――――",
-    "【会話ログ（そのまま）】",
-    chatLog || "(未入力)"
-  ].join("\n");
+  const instructions = `
+あなたは恋愛チャット診断のアナリスト。以下の会話ログから診断を生成します。
+- 出力は「日本語」。必ず **1個のJSONオブジェクトのみ** を返す（前後の説明文やコードブロックは禁止）
+- 口調は中庸だが、診断対象者が「${speakerGender}」なら相手に合わせて語尾・配慮のニュアンスを軽く寄せる
+- 文量は各フィールドを簡潔に、けれど薄くならない程度（以前のモック相当）
+- スコアは 1.0〜5.0、少数1桁
+- フィールド構成はこの例と全く同じキー・型で出す（順不問）:
+${JSON.stringify(schemaExample, null, 2)}
+`;
 
-  // OpenAI 呼び出し（Responses API + Structured Outputs）
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25000); // 25s で中断
+  const userInput = `
+[セッション名] ${sessionName}
+[出会い方] ${source}
+[関係性] ${relation}
+[ゴール] ${goal}
+[補足] ${extraInfo}
+[チャットログ]
+${chatLog}
+`;
+
+  const payload = {
+    model: MODEL,
+    // Responses API の正しい指定：response_format ではなくこちら
+    modalities: ["text"],
+    text: { format: "json_object" },
+    temperature: 0.3,
+    max_output_tokens: 2200,
+    // system 的な指示
+    instructions,
+    // ユーザー入力
+    input: userInput
+  };
 
   try {
-    const resp = await fetch(OPENAI_URL, {
-      method: "POST",
+    const ai = await fetch(OPENAI_URL, {
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.4,
-        input: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        response_format: { type: "json_schema", json_schema: schema },
-        max_output_tokens: 1800
-      }),
-      signal: controller.signal
+      body: JSON.stringify(payload)
     });
-    clearTimeout(timer);
 
-    const data = await resp.json();
-
-    if (!resp.ok) {
-      // OpenAI 側の失敗（キー不備・レートなど）→ モック返し
-      return res.status(200).json({
-        result: mockResult(),
-        source: "mock",
-        error: `${resp.status}:${data.error?.message || "OpenAI error"}`
-      });
+    if (!ai.ok) {
+      const errText = await ai.text().catch(()=>'');
+      throw new Error(`OpenAI ${ai.status}: ${errText}`);
     }
 
-    // Responses API の取り出し方
-    // SDK 相当の output_text が付く場合と、content[].text の場合がある
-    const text =
-      data.output_text ??
-      (Array.isArray(data.output) &&
-        data.output[0] &&
-        Array.isArray(data.output[0].content) &&
-        data.output[0].content.find(c => c.type === "output_text")?.text) ??
-      (Array.isArray(data.output) &&
-        data.output[0] &&
-        Array.isArray(data.output[0].content) &&
-        data.output[0].content[0]?.text) ??
-      "";
+    const data = await ai.json();
+
+    // Responses API の取り出し（text.format=json_object）
+    let txt = '';
+    if (typeof data.output_text === 'string') {
+      txt = data.output_text;
+    } else if (Array.isArray(data.output)) {
+      txt = data.output
+        .flatMap(o => Array.isArray(o.content) ? o.content : [])
+        .filter(c => c.type === 'output_text' || c.type === 'text' || c.text)
+        .map(c => c.output_text || c.text || '')
+        .join('\n');
+    }
+    if (!txt) throw new Error('parse_failed: empty output');
 
     let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      // 稀に前後に説明文が混ざるケースの保険（```json ... ``` の除去など）
-      const m = text.match(/\{[\s\S]*\}$/);
-      parsed = m ? JSON.parse(m[0]) : null;
-    }
+    try { parsed = JSON.parse(txt); }
+    catch { throw new Error('parse_failed: invalid JSON'); }
 
-    if (!parsed) {
-      // パース不能でもアプリが落ちないようモック返し
-      return res.status(200).json({
-        result: mockResult(),
-        source: "mock",
-        error: "parse_failed"
-      });
-    }
+    // フロントが期待する形で返す
+    return res.status(200).json({ source: 'openai', result: parsed });
 
-    return res.status(200).json({ result: parsed, source: "openai" });
   } catch (e) {
-    clearTimeout(timer);
-    // タイムアウト/ネットワークでも壊れない
+    // 失敗時はモックにフォールバック（落とさない）
+    const mock = mockResult();
     return res.status(200).json({
-      result: mockResult(),
-      source: "mock",
-      error: String(e).slice(0, 1800)
+      source: 'mock',
+      error: String(e?.message || e),
+      result: mock
     });
   }
-};
+}
+
+// ---- 既存の軽量モック（必要なら調整可）----
+function mockResult() {
+  return {
+    categories: ["共感力","質問力","話題展開","柔軟性","テンポ"],
+    scores: [4.2,3.6,4.1,3.2,4.4],
+    comments: {
+      "共感力":"相手の感情を要約＋感情ラベリングで受け止められています。",
+      "質問力":"Why/How を1発足すと深度が上がります。",
+      "話題展開":"自己開示→橋渡しが自然です。",
+      "柔軟性":"文量を相手に寄せるとさらに◎。",
+      "テンポ":"既読後の2段運用がGood。"
+    },
+    freeSummary:"総括：安心して話せる人…",
+    myMBTI:"INFP",
+    myMbtiLongText:"…",
+    partnerMBTI:"ENFJ",
+    compatibilityText:"…",
+    compatibilityAxes:["価値観整合","会話の相性","感情共有","未来志向","距離感調整"],
+    compatibilityScores:[4.5,3.8,4.2,4.0,3.9],
+    compatibilityReasons:{
+      "価値観整合":"…",
+      "会話の相性":"…",
+      "感情共有":"…",
+      "未来志向":"…",
+      "距離感調整":"…"
+    },
+    detailedAdvice:{
+      "共感力":[{"action":"要約＋感情で返す","effect":"…","example":"…"}],
+      "質問力":[{"action":"Why/Howを1発","effect":"…","example":"…"}],
+      "話題展開":[{"action":"ミニ体験→橋渡し","effect":"…","example":"…"}],
+      "柔軟性":[{"action":"文量合わせ","effect":"…","example":"…"}],
+      "テンポ":[{"action":"既読→本返信","effect":"…","example":"…"}]
+    },
+    partnerProfile:{
+      greenLines:["…"], redLines:["…"],
+      goodPhrases:["…"], badPhrases:["…"],
+      contactStyle:"…", dateTips:"…",
+      conflictPattern:"…", reconcileTips:"…",
+      progression:"…"
+    }
+  };
+}
