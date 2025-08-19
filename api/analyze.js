@@ -1,5 +1,9 @@
 // path: api/analyze.js
+export const config = { runtime: 'nodejs20.x' };  // ★ 追加
+
 import OpenAI from "openai";
+// …（以下は今のままでOK）
+
 
 /** ─────────────────────────────────────────────────────────────────
  * CORS（Flutterエミュ・端末どちらでもアクセスOKに）
