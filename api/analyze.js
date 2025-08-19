@@ -1,95 +1,194 @@
-// Vercel Serverless Function (Node 18+)
-// ここでは OpenAI 呼び出しはダミー化し、クライアントのモデルに合わせた JSON を返します。
-// 後で OpenAI API 呼び出しへ置き換えてOK。
+// path: api/analyze.js
+import OpenAI from "openai";
+
+/** ─────────────────────────────────────────────────────────────────
+ * CORS（Flutterエミュ・端末どちらでもアクセスOKに）
+ * ───────────────────────────────────────────────────────────────── */
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+}
+
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const TIMEOUT_MS = 45_000; // Vercel関数の実行制限内で余裕を持たせる
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    res.status(405).json({ message: 'Method Not Allowed' });
-    return;
+  setCors(res);
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+  // 1) リクエスト受け取り
+  const body = typeof req.body === "string" ? safeParse(req.body) : (req.body || {});
+  const {
+    sessionName = "",
+    chatLog = "",
+    source = "",
+    relation = "",
+    goal = "",
+    extraInfo = "",
+    speakerGender = "neutral" // "male" | "female" | "neutral"
+  } = body;
+
+  // 2) 開発用: APIキーなしならモック即返し（落ちない運用）
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(200).json(buildMockResult());
   }
+
+  // 3) OpenAI 呼び出し準備
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  // 文字量が多すぎて落ちないよう最後の方を優先して切る
+  const clippedChat = clip(String(chatLog), 8000);
+
+  // システムプロンプト（JSONのみを返させる）
+  const system = [
+    "あなたは『恋Chart』の分析エンジンです。",
+    "ユーザーが貼った会話ログとメタ情報から、会話スキル・相性・具体アドバイスを出力します。",
+    "絶対条件: **有効な JSON のみ** を返すこと。JSON以外の文字は一切出力しないこと。",
+    "日本語で、以下のスキーマに**完全準拠**して埋めること。",
+    "",
+    "型（TypeScript相当）:",
+    "type AdviceItem = { action: string; effect: string; example: string };",
+    "type PartnerProfile = {",
+    "  greenLines: string[]; redLines: string[]; goodPhrases: string[]; badPhrases: string[];",
+    "  contactStyle: string; dateTips: string; conflictPattern: string; reconcileTips: string; progression: string;",
+    "};",
+    "type Result = {",
+    "  categories: string[]; // 例: [\"共感力\",\"質問力\",\"話題展開\",\"柔軟性\",\"テンポ\"]",
+    "  scores: number[];     // categories と同じ長さ、各1..5",
+    "  comments: Record<string, string>;",
+    "  freeSummary: string;",
+    "  myMBTI: string; myMbtiLongText: string; partnerMBTI: string;",
+    "  compatibilityText: string;",
+    "  compatibilityAxes: string[]; // 5軸想定",
+    "  compatibilityScores: number[]; // compatibilityAxes と同じ長さ、各1..5",
+    "  compatibilityReasons: Record<string, string>;",
+    "  detailedAdvice: Record<string, AdviceItem[]>; // キーはスキル名",
+    "  partnerProfile: PartnerProfile;",
+    "};",
+    "",
+    "厳守:",
+    "- JSON 以外の文字を一切出力しない（前後のテキスト・```・説明文も禁止）。",
+    "- scores の配列長は categories と一致させる。",
+    "- compatibilityScores の配列長は compatibilityAxes と一致させる。",
+    "- 例文は自然で短すぎず、すぐ使える日本語にする。",
+    "- 口調: 中性的で読みやすい丁寧体。依頼がある場合は依頼の性別にわずかに寄せる。",
+  ].join("\n");
+
+  const user = [
+    `# セッション名: ${sessionName || "(未指定)"}`,
+    `# 診断者の性別: ${speakerGender}  // male|female|neutral`,
+    `# 出会い方: ${source}`,
+    `# 関係性: ${relation}`,
+    `# ゴール: ${goal}`,
+    `# 補足: ${extraInfo}`,
+    "",
+    "# 会話ログ（最近のやりとりが下ほど新しい想定。絵文字やスタンプも可）",
+    clippedChat,
+    "",
+    "出力は JSON のみ。前書き・後書き・説明は不要。"
+  ].join("\n");
 
   try {
-    const {
-      sessionName = '診断',
-      chatLog = '',
-      source = '',
-      relation = '',
-      goal = '',
-      extraInfo = '',
-      speakerGender = 'neutral',
-    } = req.body || {};
+    // 4) モデル呼び出し（タイムアウト保護）
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), TIMEOUT_MS);
 
-    // 将来の口調分岐に使える（いまはデータに同梱しておく）
-    const tone = speakerGender === 'male' ? '男性寄り' :
-                 speakerGender === 'female' ? '女性寄り' : '中立';
+    const resp = await client.chat.completions.create({
+      model: MODEL,
+      temperature: 0.7,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ],
+      response_format: { type: "json_object" }
+    }, { signal: ac.signal });
 
-    // ---- モック返却（Flutter の DiagnosisResult.mockLong と整合）----
-    const result = {
-      categories: ["共感力", "質問力", "話題展開", "柔軟性", "テンポ"],
-      scores: [4.2, 3.6, 4.1, 3.2, 4.4],
-      comments: {
-        "共感力": "相手の感情の背景を汲み取り、言い換えで返せています。特に『それ大変だったね』のような感情ラベリングが自然。",
-        "質問力": "広げる質問はできていますが、深掘りの“理由/きっかけ”問いかけが少なめ。Why/How系を1発足すだけで熱量が上がります。",
-        "話題展開": "自己開示→相手の体験へ橋渡しの流れが上手。相手が語った点に“短い感想＋共感”を挟むとさらに滑らか。",
-        "柔軟性": "相手のトーンに寄せる反応がときどき遅れ、硬い印象に。返答の粒度（長短）を相手に合わせるだけで柔らかく見えます。",
-        "テンポ": "早過ぎず遅過ぎず、読みやすいテンポ。既読スルー後の再開が丁寧で好印象です。"
-      },
-      freeSummary:
-        "総合的に“安心して話せる人”。ここから親密度を上げるには、Why質問を1ターンだけ入れる／言い換え→質問／週末タイミングで軽い提案、の3点で大きく伸びます。",
-      myMBTI: "INFP",
-      myMbtiLongText:
-        "あなたは“芯の優しさと価値観”を軸に人と関わるタイプ。恋愛では言葉選びが丁寧で、共感の厚みで相手を支えるのが得意。",
-      partnerMBTI: "ENFJ",
-      compatibilityText:
-        "理想と人への配慮が融合する相性。価値観が重なるため信頼が築きやすく、現実への落とし込みも進めやすい。",
-      compatibilityAxes: ["価値観整合", "会話の相性", "感情共有", "未来志向", "距離感調整"],
-      compatibilityScores: [4.5, 3.8, 4.2, 4.0, 3.9],
-      compatibilityReasons: {
-        "価値観整合": "理念・意味と人の調和の両輪が回りやすい。",
-        "会話の相性": "内面を探る姿勢と温かいまとめ役が噛み合う。",
-        "感情共有": "安心安全の空気を双方が大切にできる。",
-        "未来志向": "理想と実装の橋渡しが得意なペア。",
-        "距離感調整": "“希望の伝え合い”が調整弁。"
-      },
-      detailedAdvice: {
-        "共感力": [
-          { action: "要約＋感情ラベリング", effect: "理解感が増す", example: "「それって不安も強かったよね」" }
-        ],
-        "質問力": [
-          { action: "Why/Howを1発", effect: "深さが増す", example: "「どうしてそう思った？」" }
-        ],
-        "話題展開": [
-          { action: "ミニ体験→橋渡し", effect: "沈黙が減る", example: "「カフェ巡り好き。○○さんは？」" }
-        ],
-        "柔軟性": [
-          { action: "文量を合わせる", effect: "話しやすさUP", example: "「了解！じゃあ○時で🙆」" }
-        ],
-        "テンポ": [
-          { action: "軽リアク→本返信", effect: "放置感回避", example: "「読んだ！後で返すね」" }
-        ]
-      },
-      partnerProfile: {
-        greenLines: ["具体的な称賛", "“一緒に”を感じる提案"],
-        redLines: ["理由なき未読放置", "刺のある冗談"],
-        goodPhrases: ["「きっかけは何かあった？」"],
-        badPhrases: ["「普通はさ」"],
-        contactStyle: "短いやり取りの積み重ねが安心感に。",
-        dateTips: "写真映え＋静けさのある場所を。",
-        conflictPattern: "配慮不足の一言が火種に。",
-        reconcileTips: "事実→意図→感情→今後の順で端的に。",
-        progression: "次の小さな関門を置く。"
-      }
-    };
+    clearTimeout(t);
 
-    // 簡単なエコーバック（デバッグ用）
-    result.meta = {
-      tone, // 男性寄り/女性寄り/中立
-      inputs: { sessionName, source, relation, goal, note: extraInfo },
-      chatBytes: Buffer.from(chatLog ?? '').length
-    };
+    const text = resp?.choices?.[0]?.message?.content?.trim() || "";
+    const json = safeParse(text);
 
-    res.status(200).json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: e?.message ?? 'unknown error' });
+    // 最低限のバリデーション（壊れたら即モック）
+    if (!isValidResult(json)) {
+      return res.status(200).json(buildMockResult());
+    }
+
+    return res.status(200).json(json);
+  } catch (err) {
+    // タイムアウト・APIエラー時もモック返却（アプリを止めない）
+    return res.status(200).json(buildMockResult());
   }
+}
+
+/* ───────────────── ユーティリティ ───────────────── */
+
+function clip(s, max) {
+  if (!s) return "";
+  const str = String(s);
+  if (str.length <= max) return str;
+  return str.slice(-max); // 末尾優先
+}
+
+function safeParse(s) {
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
+function isValidResult(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const a = Array.isArray;
+  if (!a(obj.categories) || !a(obj.scores)) return false;
+  if (obj.categories.length === 0 || obj.scores.length !== obj.categories.length) return false;
+  if (!a(obj.compatibilityAxes) || !a(obj.compatibilityScores)) return false;
+  if (obj.compatibilityAxes.length === 0 || obj.compatibilityScores.length !== obj.compatibilityAxes.length) return false;
+  return true;
+}
+
+// クライアントの型に合うモック（落ちないための保険）
+function buildMockResult() {
+  return {
+    categories: ["共感力", "質問力", "話題展開", "柔軟性", "テンポ"],
+    scores: [4.2, 3.6, 4.1, 3.2, 4.4],
+    comments: {
+      "共感力": "相手の感情の背景を汲み取り、言い換えで返せています。",
+      "質問力": "Why/How の一言が入ると深さが増します。",
+      "話題展開": "自己開示→橋渡しの流れが上手です。",
+      "柔軟性": "文量を相手に合わせるだけで柔らかく見えます。",
+      "テンポ": "既読後の再開が丁寧で好印象。"
+    },
+    freeSummary: "総合的に“安心して話せる人”。Why 質問を1発入れると伸びます。",
+    myMBTI: "INFP",
+    myMbtiLongText: "価値観軸で丁寧に関わるタイプ。短いリアクション→本返信の二段構えが合う。",
+    partnerMBTI: "ENFJ",
+    compatibilityText: "理想と配慮が融合する相性。小さな本音を早めに共有すると強みが最大化。",
+    compatibilityAxes: ["価値観整合", "会話の相性", "感情共有", "未来志向", "距離感調整"],
+    compatibilityScores: [4.5, 3.8, 4.2, 4.0, 3.9],
+    compatibilityReasons: {
+      "価値観整合": "理念×調和で協力関係が築きやすい。",
+      "会話の相性": "丁寧×まとめ役で熱量が噛み合う。",
+      "感情共有": "安心安全を双方が重視。",
+      "未来志向": "意味と実装力の橋渡しが得意。",
+      "距離感調整": "希望の伝え合いが調整弁になる。"
+    },
+    detailedAdvice: {
+      "共感力": [
+        { action: "要約＋感情ラベリング", effect: "伝わっている感が増す", example: "「それって不安もあったよね」" }
+      ],
+      "質問力": [
+        { action: "Why/How を1発", effect: "語りの深さUP", example: "「どうしてそう思った？」" }
+      ]
+    },
+    partnerProfile: {
+      greenLines: ["感情の言語化", "具体的な称賛", "小さな共同作業"],
+      redLines: ["理由不明の既読スルー", "皮肉が強い冗談", "曖昧な約束"],
+      goodPhrases: ["「きっかけはあった？」", "「そこが特にいいね」"],
+      badPhrases: ["「普通こうでしょ？」", "「大したことないよ」"],
+      contactStyle: "短いやり取りを重ねると安心感が増す。",
+      dateTips: "写真映え＋静けさの両立。初回は軽め設計。",
+      conflictPattern: "配慮不足の一言が発火点になりやすい。",
+      reconcileTips: "事実→意図→感情→今後で短く整理。",
+      progression: "次の小さな関門を置くと前進しやすい。"
+    }
+  };
 }
