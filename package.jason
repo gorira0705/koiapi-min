@@ -1,6 +1,10 @@
 {
   "name": "koiapi-min",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=20 <21" },
+  "dependencies": {
+    "openai": "^4.57.0"
+  }
 }
