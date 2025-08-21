@@ -1,19 +1,17 @@
+// path: api/analyze.js
 // Vercel Serverless Function (Node.js 20/22)
 // 必要環境変数: OPENAI_API_KEY
-// ※ package.json に "openai": "^4.x" を入れておいてください。
 
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// 固定カテゴリ・相性軸（アプリ側UIと一致させる）
 const FIXED_CATEGORIES = ["共感力", "質問力", "話題展開", "柔軟性", "テンポ"];
 const FIXED_AXES = ["価値観整合", "会話の相性", "感情共有", "未来志向", "距離感調整"];
 
-// 長文化＆安定化した system プロンプト
-const system = `
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
+}
+
+const systemPrompt = `
 あなたは会話ログから恋愛の相性と会話スキルを分析するアシスタントです。
 出力は必ず **日本語のJSONオブジェクト1つだけ**。プレーンテキストや説明は一切入れない。
 数値は 1.0〜5.0 の小数1桁。配列とキー名はスキーマ通り。
@@ -27,8 +25,7 @@ const system = `
 厳守ルール:
 - categories は次の**固定名**をこの順番で使う: ${FIXED_CATEGORIES.join(", ")}
 - compatibilityAxes も次の**固定名**をこの順番で使う: ${FIXED_AXES.join(", ")}
-- detailedAdvice は **全ての categories キー**（上記5つ）を必ず持ち、各配列に **最低3件**入れる
-  （{ "action": "...", "effect": "...", "example": "..." } の形）。
+- detailedAdvice は **全ての categories キー**（上記5つ）を必ず持ち、各配列に **最低3件**入れる（{ "action": "...", "effect": "...", "example": "..." }）。
 - 例文はLINEメッセージとして違和感がない一文にする（絵文字は多用しない）。
 
 文字量の目安（厳守）:
@@ -37,8 +34,7 @@ const system = `
 - myMbtiLongText：280〜380字
 - compatibilityText：260〜360字
 - compatibilityReasons：各150〜220字
-- detailedAdvice：各カテゴリに**3件**。
-  - action 12〜20字／effect 40〜80字／example 40〜80字
+- detailedAdvice：各カテゴリに**3件**（action 12〜20字／effect 40〜80字／example 40〜80字）
 - partnerProfile：
   - greenLines 4〜6件（各18〜28字）／redLines 3〜5件（各18〜28字）
   - goodPhrases・badPhrases 各3〜5件（10〜24字）
@@ -58,14 +54,14 @@ const system = `
   "compatibilityScores": [5つの数値],
   "compatibilityReasons": { "<各軸>": "<理由>" },
   "detailedAdvice": {
-    "共感力": [ { "action": "...", "effect": "...", "example": "..." }, ... (計3件) ],
-    "質問力": [ ...3件 ],
-    "話題展開": [ ...3件 ],
-    "柔軟性": [ ...3件 ],
-    "テンポ": [ ...3件 ]
+    "共感力": [ { "action": "...", "effect": "...", "example": "..." }, ...(計3件) ],
+    "質問力": [ ...(計3件) ],
+    "話題展開": [ ...(計3件) ],
+    "柔軟性": [ ...(計3件) ],
+    "テンポ": [ ...(計3件) ]
   },
   "partnerProfile": {
-    "greenLines": ["...", "...", "..."],
+    "greenLines": ["...", "..."],
     "redLines": ["...", "..."],
     "goodPhrases": ["...", "..."],
     "badPhrases": ["...", "..."],
@@ -78,166 +74,171 @@ const system = `
 }
 `;
 
-// Node ランタイム（Edge ではない）。Vercel標準の req/res で動く。
-export default async function handler(req, res) {
-  try {
-    // ---- ① CORS と OPTIONS（プリフライト）対応を追加 ----
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (req.method === "OPTIONS") {
-      return res.status(200).end(); // プリフライトは即OK
-    }
-    // ------------------------------------------------------
+module.exports = async (req, res) => {
+  setCors(res);
 
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST, OPTIONS");
-      return res.status(405).json({ error: "Method Not Allowed" });
-    }
-
-    const body = await readJsonBody(req);
-    const {
-      sessionName = "",
-      chatLog = "",
-      source = "",
-      relation = "",
-      goal = "",
-      extraInfo = "",
-      speakerGender = "neutral",
-    } = body || {};
-
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
-    }
-    if (!chatLog || typeof chatLog !== "string") {
-      return res.status(400).json({ error: "chatLog is required (string)" });
-    }
-
-    // 入力長の安全装置
-    const bounded = boundText(chatLog, 6000);
-
-    const userPrompt = [
-      `【入力メタ】`,
-      JSON.stringify(
-        { sessionName, source, relation, goal, extraInfo, speakerGender },
-        null,
-        0
-      ),
-      "",
-      "【会話ログ（最新に近い順でOK / 不要な固有名詞は伏せ可）】",
-      bounded,
-      "",
-      "【出力要件】上記スキーマ通りの JSON を厳密に1つだけ返す（プレーンテキスト禁止）。",
-    ].join("\n");
-
-    // Responses API
-    const resp = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: userPrompt },
-      ],
-      max_output_tokens: 2200,
-    });
-
-    const text =
-      (resp.output_text && resp.output_text.trim()) ||
-      extractFirstText(resp) ||
-      "";
-
-    if (!text) {
-      return res.status(502).json({ error: "Empty response from OpenAI" });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (_) {
-      const recovered = tryExtractJson(text);
-      if (!recovered) {
-        return res
-          .status(502)
-          .json({ error: "Failed to parse JSON from OpenAI", raw: text });
-      }
-      parsed = recovered;
-    }
-
-    // 最小バリデーション（カテゴリ・軸の順序）
-    if (
-      !Array.isArray(parsed.categories) ||
-      FIXED_CATEGORIES.some((n, i) => parsed.categories[i] !== n) ||
-      !Array.isArray(parsed.compatibilityAxes) ||
-      FIXED_AXES.some((n, i) => parsed.compatibilityAxes[i] !== n)
-    ) {
-      return res.status(502).json({
-        error: "Schema mismatch (categories/axes order invalid)",
-        got: {
-          categories: parsed.categories,
-          compatibilityAxes: parsed.compatibilityAxes,
-        },
-      });
-    }
-
-    return res.status(200).json({ source: "openai", result: parsed });
-  } catch (err) {
-    const message =
-      (err?.response?.data && JSON.stringify(err.response.data)) ||
-      err?.message ||
-      String(err);
-    return res.status(500).json({ error: `OpenAI error: ${message}` });
+  // プリフライト
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
   }
-}
 
-// ───────────────────────── ヘルパ ─────────────────────────
+  // HEAD（生存確認用）
+  if (req.method === "HEAD") {
+    res.status(200).end();
+    return;
+  }
 
+  // GET（ブラウザ直叩き確認用）
+  if (req.method === "GET") {
+    res.status(200).json({
+      ok: true,
+      endpoint: "/api/analyze",
+      method: "GET",
+      note: "Use POST with JSON body { chatLog, ... } to analyze.",
+      time: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // 本番：POST
+  if (req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      const {
+        sessionName = "",
+        chatLog = "",
+        source = "",
+        relation = "",
+        goal = "",
+        extraInfo = "",
+        speakerGender = "neutral",
+      } = body || {};
+
+      if (!process.env.OPENAI_API_KEY) {
+        res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+        return;
+      }
+      if (!chatLog || typeof chatLog !== "string") {
+        res.status(400).json({ error: "chatLog is required (string)" });
+        return;
+      }
+
+      const bounded = boundText(chatLog, 6000);
+      const userPrompt = [
+        `【入力メタ】`,
+        JSON.stringify(
+          { sessionName, source, relation, goal, extraInfo, speakerGender },
+          null,
+          0
+        ),
+        "",
+        "【会話ログ（最新に近い順でOK / 不要な固有名詞は伏せ可）】",
+        bounded,
+        "",
+        "【出力要件】上記スキーマ通りの JSON を厳密に1つだけ返す（プレーンテキスト禁止）。",
+      ].join("\n");
+
+      // OpenAI Responses API を素の fetch で呼ぶ（Node20+は fetch 標準対応）
+      const oai = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4.1-mini",
+          input: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          max_output_tokens: 2200,
+        }),
+      });
+
+      if (!oai.ok) {
+        const text = await oai.text();
+        res.status(500).json({ error: `OpenAI error: ${text}` });
+        return;
+      }
+
+      const data = await oai.json();
+      const text =
+        (data.output_text && String(data.output_text).trim()) ||
+        extractFirstText(data) ||
+        "";
+
+      if (!text) {
+        res.status(502).json({ error: "Empty response from OpenAI" });
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        const recovered = tryExtractJson(text);
+        if (!recovered) {
+          res.status(502).json({ error: "Failed to parse JSON", raw: text });
+          return;
+        }
+        parsed = recovered;
+      }
+
+      // 最小バリデーション
+      if (
+        !Array.isArray(parsed.categories) ||
+        FIXED_CATEGORIES.some((n, i) => parsed.categories[i] !== n) ||
+        !Array.isArray(parsed.compatibilityAxes) ||
+        FIXED_AXES.some((n, i) => parsed.compatibilityAxes[i] !== n)
+      ) {
+        res.status(502).json({
+          error: "Schema mismatch (categories/axes order invalid)",
+          got: {
+            categories: parsed.categories,
+            compatibilityAxes: parsed.compatibilityAxes,
+          },
+        });
+        return;
+      }
+
+      res.status(200).json({ source: "openai", result: parsed });
+      return;
+    } catch (err) {
+      res.status(500).json({ error: String(err?.message || err) });
+      return;
+    }
+  }
+
+  // それ以外
+  res.setHeader("Allow", "GET,POST,HEAD,OPTIONS");
+  res.status(405).json({ error: "Method Not Allowed" });
+};
+
+// ─────────────── helpers ───────────────
 async function readJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   const chunks = [];
   for await (const c of req) chunks.push(Buffer.from(c));
   const raw = Buffer.concat(chunks).toString("utf8");
-  try {
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
-
 function boundText(text, max) {
   if (text.length <= max) return text;
   const head = text.slice(0, Math.floor(max * 0.7));
   const tail = text.slice(-Math.floor(max * 0.2));
   return `${head}\n…(中略)…\n${tail}`;
 }
-
-// ---- ② SDKの出力形の揺れに強くする（保険） ----
 function extractFirstText(resp) {
   try {
-    if (resp.output_text) return resp.output_text;
-    const out = resp.output;
-    if (Array.isArray(out) && out.length > 0) {
-      const content = out[0]?.content;
-      if (Array.isArray(content)) {
-        // type が output_text / text / 省略 のどれでも拾う
-        const item =
-          content.find((c) => c.type === "output_text" && c.text) ??
-          content.find((c) => c.type === "text" && c.text) ??
-          content.find((c) => typeof c?.text === "string");
-        return item?.text ?? null;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
+    const block = resp.output?.[0];
+    const item = block?.content?.find?.((c) => c.type === "output_text");
+    return item?.text ?? null;
+  } catch { return null; }
 }
-
 function tryExtractJson(text) {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
-  }
+  const s = text.indexOf("{");
+  const e = text.lastIndexOf("}");
+  if (s === -1 || e === -1 || e <= s) return null;
+  try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
 }
