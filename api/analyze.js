@@ -1,6 +1,7 @@
-// api/analyze.js
-// 既存ロジックを保ちつつ、405/プリフライト/GETヘルスチェックを吸収する最小修正版
+// Vercel Serverless Function (Node.js)
 // 必要環境変数: OPENAI_API_KEY
+// 依存: "openai": "^4.58.1" など v4 系
+
 import OpenAI from "openai";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -9,15 +10,36 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const FIXED_CATEGORIES = ["共感力", "質問力", "話題展開", "柔軟性", "テンポ"];
 const FIXED_AXES = ["価値観整合", "会話の相性", "感情共有", "未来志向", "距離感調整"];
 
-// CORS & 共通ヘッダ
-function setCommonHeaders(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
+// CORS
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Cache-Control", "no-store");
 }
 
-// 長文化＆安定化した system プロンプト（既存方針を維持）
+// 簡易レートリミット（サーバレスでの温存期間内のみ有効）
+const BUCKET = new Map(); // ip -> [timestamps]
+const WINDOW_MS = 60 * 1000; // 60s
+const MAX_PER_WINDOW = 6;
+
+function tooMany(ip) {
+  const now = Date.now();
+  const arr = BUCKET.get(ip) || [];
+  const kept = arr.filter((t) => now - t < WINDOW_MS);
+  kept.push(now);
+  BUCKET.set(ip, kept);
+  return kept.length > MAX_PER_WINDOW;
+}
+
+// 長文を前後サンドで上限内に収める
+function boundText(text, max) {
+  if (!text || text.length <= max) return text || "";
+  const head = text.slice(0, Math.floor(max * 0.7));
+  const tail = text.slice(-Math.floor(max * 0.25));
+  return `${head}\n…(中略)…\n${tail}`;
+}
+
 const system = `
 あなたは会話ログから恋愛の相性と会話スキルを分析するアシスタントです。
 出力は必ず **日本語のJSONオブジェクト1つだけ**。プレーンテキストや説明は一切入れない。
@@ -42,7 +64,7 @@ const system = `
 - myMbtiLongText：280〜380字
 - compatibilityText：260〜360字
 - compatibilityReasons：各150〜220字
-- detailedAdvice：各カテゴリに**3件**。
+- detailedAdvice：各カテゴリに**3件**
   - action 12〜20字／effect 40〜80字／example 40〜80字
 - partnerProfile：
   - greenLines 4〜6件（各18〜28字）／redLines 3〜5件（各18〜28字）
@@ -63,11 +85,11 @@ const system = `
   "compatibilityScores": [5つの数値],
   "compatibilityReasons": { "<各軸>": "<理由>" },
   "detailedAdvice": {
-    "共感力": [ { "action": "...", "effect": "...", "example": "..." }, ...(計3件) ],
-    "質問力": [ ...(3件) ],
-    "話題展開": [ ...(3件) ],
-    "柔軟性": [ ...(3件) ],
-    "テンポ": [ ...(3件) ]
+    "共感力": [ { "action": "...", "effect": "...", "example": "..." }, ... (計3件) ],
+    "質問力": [ ...3件 ],
+    "話題展開": [ ...3件 ],
+    "柔軟性": [ ...3件 ],
+    "テンポ": [ ...3件 ]
   },
   "partnerProfile": {
     "greenLines": ["...", "..."],
@@ -84,24 +106,29 @@ const system = `
 `;
 
 export default async function handler(req, res) {
-  setCommonHeaders(res);
+  setCors(res);
 
-  // プリフライト/ヘルスチェックで 405 を出さない
-  if (req.method === "OPTIONS" || req.method === "HEAD") {
-    return res.status(204).end();
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
   }
-  if (req.method === "GET") {
-    return res.status(200).json({ ok: true, route: "/api/analyze", method: "GET" });
-  }
+
   if (req.method !== "POST") {
-    res.setHeader("Allow", "GET,POST,OPTIONS,HEAD");
+    res.setHeader("Allow", "POST, OPTIONS");
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
-  // ここから本処理（POST）
   try {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+    }
+
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket?.remoteAddress ||
+      "unknown";
+
+    if (tooMany(ip)) {
+      return res.status(429).json({ error: "Too Many Requests" });
     }
 
     const body = await readJsonBody(req);
@@ -119,7 +146,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "chatLog is required (string)" });
     }
 
-    const bounded = boundText(chatLog, 6000);
+    const bounded = boundText(chatLog, 12000);
 
     const userPrompt = [
       `【入力メタ】`,
@@ -129,20 +156,21 @@ export default async function handler(req, res) {
         0
       ),
       "",
-      "【会話ログ】",
+      "【会話ログ（最新に近い順でOK / 不要な固有名詞は伏せ可）】",
       bounded,
       "",
       "【出力要件】上記スキーマ通りの JSON を厳密に1つだけ返す（プレーンテキスト禁止）。",
     ].join("\n");
 
-    // Responses API（modalities/response_format は使用しない）
+    const started = Date.now();
+
     const resp = await client.responses.create({
       model: "gpt-4.1-mini",
       input: [
         { role: "system", content: system },
         { role: "user", content: userPrompt },
       ],
-      max_output_tokens: 2200,
+      max_output_tokens: 3400,
     });
 
     const text =
@@ -157,41 +185,43 @@ export default async function handler(req, res) {
     let parsed;
     try {
       parsed = JSON.parse(text);
-    } catch {
+    } catch (_) {
       const recovered = tryExtractJson(text);
       if (!recovered) {
-        return res.status(502).json({ error: "Failed to parse JSON from OpenAI", raw: text });
+        return res
+          .status(502)
+          .json({ error: "Failed to parse JSON from OpenAI", raw: text });
       }
       parsed = recovered;
     }
 
-    // 最小バリデーション（カテゴリ・軸の順序）
-    if (
-      !Array.isArray(parsed.categories) ||
-      FIXED_CATEGORIES.some((n, i) => parsed.categories[i] !== n) ||
-      !Array.isArray(parsed.compatibilityAxes) ||
-      FIXED_AXES.some((n, i) => parsed.compatibilityAxes[i] !== n)
-    ) {
-      return res.status(502).json({
-        error: "Schema mismatch (categories/axes order invalid)",
-        got: {
-          categories: parsed.categories,
-          compatibilityAxes: parsed.compatibilityAxes,
-        },
-      });
-    }
+    // 最小バリデーション & 補正
+    const fixed = normalizeSchema(parsed);
 
-    return res.status(200).json({ source: "openai", result: parsed });
+    // ログ（本文は残さない）
+    console.log(
+      JSON.stringify({
+        event: "analyze_ok",
+        ip,
+        ms: Date.now() - started,
+        inputChars: chatLog.length,
+        outKeys: Object.keys(fixed || {}).length,
+      })
+    );
+
+    return res.status(200).json({ source: "openai", result: fixed });
   } catch (err) {
     const message =
       (err?.response?.data && JSON.stringify(err.response.data)) ||
       err?.message ||
       String(err);
+    console.error(JSON.stringify({ event: "analyze_error", message }));
     return res.status(500).json({ error: `OpenAI error: ${message}` });
   }
 }
 
-// ────────── ヘルパ ──────────
+// ──────────────── ヘルパ ────────────────
+
 async function readJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   const chunks = [];
@@ -202,13 +232,6 @@ async function readJsonBody(req) {
   } catch {
     return {};
   }
-}
-
-function boundText(text, max) {
-  if (text.length <= max) return text;
-  const head = text.slice(0, Math.floor(max * 0.7));
-  const tail = text.slice(-Math.floor(max * 0.2));
-  return `${head}\n…(中略)…\n${tail}`;
 }
 
 function extractFirstText(resp) {
@@ -230,4 +253,87 @@ function tryExtractJson(text) {
   } catch {
     return null;
   }
+}
+
+function clampScore(v) {
+  const n = Number(v);
+  if (Number.isNaN(n)) return 3.0;
+  return Math.min(5.0, Math.max(1.0, Math.round(n * 10) / 10));
+}
+
+function ensureArray(a) {
+  return Array.isArray(a) ? a : [];
+}
+
+function normalizeSchema(x) {
+  const out = {};
+
+  // categories / scores
+  out.categories = [...FIXED_CATEGORIES];
+  const rawScores = ensureArray(x?.scores);
+  out.scores = out.categories.map((_, i) => clampScore(rawScores[i] ?? 3.0));
+
+  // comments
+  out.comments = {};
+  for (const k of FIXED_CATEGORIES) {
+    out.comments[k] =
+      typeof x?.comments?.[k] === "string" ? x.comments[k] : "";
+  }
+
+  // free texts
+  out.freeSummary = typeof x?.freeSummary === "string" ? x.freeSummary : "";
+  out.myMBTI = typeof x?.myMBTI === "string" ? x.myMBTI : "";
+  out.myMbtiLongText =
+    typeof x?.myMbtiLongText === "string" ? x.myMbtiLongText : "";
+  out.partnerMBTI =
+    typeof x?.partnerMBTI === "string" ? x.partnerMBTI : "";
+
+  // compatibility
+  out.compatibilityText =
+    typeof x?.compatibilityText === "string" ? x.compatibilityText : "";
+  out.compatibilityAxes = [...FIXED_AXES];
+  const rawCompat = ensureArray(x?.compatibilityScores);
+  out.compatibilityScores = out.compatibilityAxes.map((_, i) =>
+    clampScore(rawCompat[i] ?? 3.0)
+  );
+  out.compatibilityReasons = {};
+  for (const k of FIXED_AXES) {
+    out.compatibilityReasons[k] =
+      typeof x?.compatibilityReasons?.[k] === "string"
+        ? x.compatibilityReasons[k]
+        : "";
+  }
+
+  // detailedAdvice（各カテゴリ 3件以上を期待。足りなければ空配列のままでもUIは崩れない）
+  out.detailedAdvice = {};
+  for (const k of FIXED_CATEGORIES) {
+    const arr = ensureArray(x?.detailedAdvice?.[k])
+      .filter(
+        (it) =>
+          it &&
+          typeof it.action === "string" &&
+          typeof it.effect === "string" &&
+          typeof it.example === "string"
+      )
+      .slice(0, 10); // 安全
+    out.detailedAdvice[k] = arr;
+  }
+
+  // partnerProfile
+  const pp = x?.partnerProfile || {};
+  out.partnerProfile = {
+    greenLines: ensureArray(pp.greenLines),
+    redLines: ensureArray(pp.redLines),
+    goodPhrases: ensureArray(pp.goodPhrases),
+    badPhrases: ensureArray(pp.badPhrases),
+    contactStyle: typeof pp.contactStyle === "string" ? pp.contactStyle : "",
+    dateTips: typeof pp.dateTips === "string" ? pp.dateTips : "",
+    conflictPattern:
+      typeof pp.conflictPattern === "string" ? pp.conflictPattern : "",
+    reconcileTips:
+      typeof pp.reconcileTips === "string" ? pp.reconcileTips : "",
+    progression: typeof pp.progression === "string" ? pp.progression : "",
+  };
+
+  return out;
 }
