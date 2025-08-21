@@ -81,13 +81,21 @@ const system = `
 // Node ランタイム（Edge ではない）。Vercel標準の req/res で動く。
 export default async function handler(req, res) {
   try {
+    // ---- ① CORS と OPTIONS（プリフライト）対応を追加 ----
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (req.method === "OPTIONS") {
+      return res.status(200).end(); // プリフライトは即OK
+    }
+    // ------------------------------------------------------
+
     if (req.method !== "POST") {
-      res.setHeader("Allow", "POST");
+      res.setHeader("Allow", "POST, OPTIONS");
       return res.status(405).json({ error: "Method Not Allowed" });
     }
 
     const body = await readJsonBody(req);
-
     const {
       sessionName = "",
       chatLog = "",
@@ -101,25 +109,17 @@ export default async function handler(req, res) {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
     }
-
     if (!chatLog || typeof chatLog !== "string") {
       return res.status(400).json({ error: "chatLog is required (string)" });
     }
 
-    // 入力長の安全装置（異常に長いログは先頭・末尾を残して圧縮）
+    // 入力長の安全装置
     const bounded = boundText(chatLog, 6000);
 
     const userPrompt = [
       `【入力メタ】`,
       JSON.stringify(
-        {
-          sessionName,
-          source,
-          relation,
-          goal,
-          extraInfo,
-          speakerGender,
-        },
+        { sessionName, source, relation, goal, extraInfo, speakerGender },
         null,
         0
       ),
@@ -130,14 +130,13 @@ export default async function handler(req, res) {
       "【出力要件】上記スキーマ通りの JSON を厳密に1つだけ返す（プレーンテキスト禁止）。",
     ].join("\n");
 
-    // ★ Responses API（2024+）。modalities/response_format は使わない。
+    // Responses API
     const resp = await client.responses.create({
       model: "gpt-4.1-mini",
       input: [
         { role: "system", content: system },
         { role: "user", content: userPrompt },
       ],
-      // 長文を出すための上限。必要に応じて増減可
       max_output_tokens: 2200,
     });
 
@@ -154,7 +153,6 @@ export default async function handler(req, res) {
     try {
       parsed = JSON.parse(text);
     } catch (_) {
-      // モデルが余計な前置きを返した場合、JSON 部分だけを抽出して再パース
       const recovered = tryExtractJson(text);
       if (!recovered) {
         return res
@@ -171,7 +169,6 @@ export default async function handler(req, res) {
       !Array.isArray(parsed.compatibilityAxes) ||
       FIXED_AXES.some((n, i) => parsed.compatibilityAxes[i] !== n)
     ) {
-      // 形式ズレはエラー返却（Flutter側がフォールバック表示に切り替える）
       return res.status(502).json({
         error: "Schema mismatch (categories/axes order invalid)",
         got: {
@@ -181,10 +178,7 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({
-      source: "openai",
-      result: parsed,
-    });
+    return res.status(200).json({ source: "openai", result: parsed });
   } catch (err) {
     const message =
       (err?.response?.data && JSON.stringify(err.response.data)) ||
@@ -196,10 +190,8 @@ export default async function handler(req, res) {
 
 // ───────────────────────── ヘルパ ─────────────────────────
 
-// Vercel Node ランタイムで JSON を安定して読む
 async function readJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
-  // bodyParser 無効時の保険
   const chunks = [];
   for await (const c of req) chunks.push(Buffer.from(c));
   const raw = Buffer.concat(chunks).toString("utf8");
@@ -210,7 +202,6 @@ async function readJsonBody(req) {
   }
 }
 
-// 長文を前後でサンドイッチして上限内に収める
 function boundText(text, max) {
   if (text.length <= max) return text;
   const head = text.slice(0, Math.floor(max * 0.7));
@@ -218,18 +209,28 @@ function boundText(text, max) {
   return `${head}\n…(中略)…\n${tail}`;
 }
 
-// Responses API オブジェクトから最初のテキストを拾う保険
+// ---- ② SDKの出力形の揺れに強くする（保険） ----
 function extractFirstText(resp) {
   try {
-    const block = resp.output?.[0];
-    const item = block?.content?.find?.((c) => c.type === "output_text");
-    return item?.text ?? null;
+    if (resp.output_text) return resp.output_text;
+    const out = resp.output;
+    if (Array.isArray(out) && out.length > 0) {
+      const content = out[0]?.content;
+      if (Array.isArray(content)) {
+        // type が output_text / text / 省略 のどれでも拾う
+        const item =
+          content.find((c) => c.type === "output_text" && c.text) ??
+          content.find((c) => c.type === "text" && c.text) ??
+          content.find((c) => typeof c?.text === "string");
+        return item?.text ?? null;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-// テキストから JSON 部分だけ抽出して parse
 function tryExtractJson(text) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
